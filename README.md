@@ -69,7 +69,10 @@ curl http://localhost:8000/health
 
 **测试 OpenAI 兼容接口**：
 
+### 基础测试（非流式）
+
 ```bash
+# Gemini 2.5 Flash - 简单问答
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -77,11 +80,117 @@ curl -X POST http://localhost:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "What is 2+2?"}]
   }'
 
+# Gemini 3 Flash - 简单问候
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "google/gemini-3-flash-preview",
     "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+### 流式输出测试
+
+```bash
+# Gemini 2.5 Flash - 流式输出
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-2.5-flash-low",
+    "messages": [{"role": "user", "content": "Tell me a short story about a robot."}],
+    "stream": true
+  }'
+
+# Gemini 3 Flash - 流式输出（中文）
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-3-flash-preview",
+    "messages": [{"role": "user", "content": "请用中文讲一个简短的关于AI的故事"}],
+    "stream": true
+  }'
+```
+
+### 系统消息测试
+
+```bash
+# 带系统消息的测试
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-2.5-flash-low",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant specialized in mathematics."},
+      {"role": "user", "content": "What is the derivative of x²?"}
+    ]
+  }'
+```
+
+### 多轮对话测试
+
+```bash
+# 多轮对话（带历史消息）
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-3-flash-preview",
+    "messages": [
+      {"role": "user", "content": "What is the capital of France?"},
+      {"role": "assistant", "content": "The capital of France is Paris."},
+      {"role": "user", "content": "What about Germany?"}
+    ]
+  }'
+```
+
+### 参数测试
+
+```bash
+# 温度和最大 token 测试
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-2.5-flash-low",
+    "messages": [{"role": "user", "content": "Write a creative poem."}],
+    "temperature": 0.8,
+    "max_tokens": 100
+  }'
+
+# 低温度测试（更确定性）
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-3-flash-preview",
+    "messages": [{"role": "user", "content": "What is 10 * 10?"}],
+    "temperature": 0.1,
+    "max_tokens": 50
+  }'
+```
+
+### 高级测试
+
+```bash
+# JSON 格式输出
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-2.5-flash-low",
+    "messages": [{"role": "user", "content": "Return the answer in JSON format: What are the primary colors?"}]
+  }'
+
+# 代码生成测试
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-3-flash-preview",
+    "messages": [{"role": "user", "content": "Write a Python function to calculate factorial."}]
+  }'
+
+# 长文本处理
+curl -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-2.5-flash-low",
+    "messages": [{"role": "user", "content": "Summarize the following text in 3 bullet points: The history of artificial intelligence dates back to antiquity. Philosophers described the process of human thinking as the symbolic manipulation of the mind. In the 1940s, the invention of the programmable digital computer gave birth to the field of AI. Over the decades, AI has evolved from simple rule-based systems to complex machine learning models that can perform tasks ranging from image recognition to natural language processing."}]
   }'
 ```
 
