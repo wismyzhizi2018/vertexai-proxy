@@ -1,6 +1,7 @@
 # Openclaw 通过 VertexAI-Proxy 接入 Gemini 安装与使用手册
 
-> [openclaw是什么?访问地址](https://github.com/openclaw/openclaw)
+> [Openclaw是什么?访问地址](https://github.com/openclaw/openclaw)
+
 **Linux 服务器（示例路径 /root）**  
 **Google Cloud 项目（写作 `<YOUR_GCP_PROJECT_ID>`）**
 
