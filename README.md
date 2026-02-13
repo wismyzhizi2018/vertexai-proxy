@@ -42,7 +42,7 @@ gcloud config set project <YOUR_GCP_PROJECT_ID>
 cd ~
 mkdir -p vertexai-proxy
 cd vertexai-proxy/
-git clone https://github.com/danzam98/vertexai-proxy.git
+git clone https://github.com/wismyzhizi2018/vertexai-proxy.git
 cd vertexai-proxy/
 pip install -r requirements.txt
 cp .env.example .env
