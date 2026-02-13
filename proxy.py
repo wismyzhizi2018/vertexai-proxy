@@ -21,7 +21,7 @@ load_dotenv()
 app = FastAPI(title="Vertex AI Reasoning Proxy")
 
 # ========== 配置 ==========
-VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", "gen-lang-client-0041139433")
+VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", "")
 VERTEX_AI_REGION = os.getenv("VERTEX_AI_REGION", "us-west1")
 
 PROXY_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
