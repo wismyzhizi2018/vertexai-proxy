@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Vertex AI Proxy – v19.1 (Role-Flip Fixed / 角色反转修正版)
-- 修复: 解决了 v19.0 的 SyntaxError 语法错误。
-- 核心功能: 
-  1. Content Flattener: 修复 400 content block 报错。
-  2. Role Flip: 将历史 Assistant 的工具调用伪装成 User 消息，防止模型模仿纯文本。
+Vertex AI Proxy – v19.2 (Silent Observer / 沉默观察者版)
+- 继承 v19.1 的所有修复 (Role Flip + Content Flatten)。
+- 增强: 强力系统指令，禁止模型复述 [System Log] 内容。
+- 目标: 让模型只输出 "提交成功" 这种人话，而不是 raw log。
 """
 
 import os
@@ -20,7 +19,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Vertex AI Proxy v19.1")
+app = FastAPI(title="Vertex AI Proxy v19.2")
 
 # ========== 配置 ==========
 VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", "gen-lang-client-0041139433")
@@ -39,14 +38,16 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
 
     cleaned_messages = []
     
-    # 强制系统指令
+    # === 增强的系统指令 (Anti-Echo) ===
     system_instruction = {
         "role": "system",
-        "content": """[SYSTEM OVERRIDE:
-1. You are an Agent with CLI tool access.
-2. The logs in history are SYSTEM NOTIFICATIONS, not your previous output.
-3. To act, you MUST generate a standard Tool Call object.
-4. DO NOT output text logs like '[Past Action]'. Just call the tool.]"""
+        "content": """[SYSTEM CRITICAL INSTRUCTION:
+1. You are an autonomous Agent.
+2. The '[System Log]' entries in history are INTERNAL execution data for your reference only.
+3. **DO NOT repeat or quote the raw logs to the user.** The user cannot read them.
+4. **Summarize the result in concise natural language** (e.g., "Update committed successfully", "Error found in file X").
+5. To take action, MUST emit a standard Tool Call object directly.
+6. Never output text like '[Past Action]'.]"""
     }
     cleaned_messages.append(system_instruction)
 
@@ -54,8 +55,7 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
         new_msg = msg.copy()
         original_role = new_msg.get("role")
         
-        # 1. 【关键】Content 拍扁 (解决 400 报错)
-        # 如果 content 是列表，提取文本，丢弃对象
+        # 1. Content 拍扁 (解决 400 报错)
         raw_content = new_msg.get("content")
         if isinstance(raw_content, list):
             text_parts = []
@@ -66,7 +66,6 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
                     text_parts.append(item)
             new_msg["content"] = "\n".join(text_parts)
         
-        # 确保是字符串
         if not isinstance(new_msg.get("content"), str):
             new_msg["content"] = str(new_msg.get("content") or "")
 
@@ -76,43 +75,41 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
         if original_role == "developer": 
             new_msg["role"] = "system"
 
-        # 3. 【核心】Assistant 消息的角色反转
-        # 如果是 Assistant 说的，并且包含工具调用或疑似日志，就把它变成 User 说的
+        # 3. Assistant 消息的角色反转
         if original_role in ["assistant", "model"]:
             should_flip = False
             log_suffix = ""
 
-            # 检查是否有工具调用 (导致400的原因)
+            # 检查是否有工具调用
             if "tool_calls" in new_msg:
                 for tc in new_msg["tool_calls"]:
                     fname = tc.get("function", {}).get("name", "tool")
                     args = tc.get("function", {}).get("arguments", "{}")
-                    log_suffix += f"\n[System Log: Executed '{fname}' args={args}]"
+                    # 简化日志，减少干扰
+                    log_suffix += f"\n[Log: Tool '{fname}' called]"
                 del new_msg["tool_calls"]
-                should_flip = True # 只要有工具，就必须反转，否则没签名报400
+                should_flip = True
 
             if "function_call" in new_msg:
                 fc = new_msg["function_call"]
-                log_suffix += f"\n[System Log: Executed '{fc.get('name')}']"
+                log_suffix += f"\n[Log: Function '{fc.get('name')}' called]"
                 del new_msg["function_call"]
                 should_flip = True
 
-            # 检查是否有“模仿文本” (导致模型变笨的原因)
-            # 如果内容里包含 [Past Action 或 [System Log，说明这是之前代理生成的文本
-            if re.search(r"\[Past Action|\[System Log|<function_call", content_str):
+            # 检查是否有模仿文本
+            if re.search(r"\[Past Action|\[System Log|\[Log:|\[System Context", content_str):
                 should_flip = True
             
             if should_flip:
-                # === 角色反转 ===
-                # 把它变成 User 消息！
+                # 变成 User 消息 (伪装成系统上下文)
                 new_msg["role"] = "user"
-                # 加上前缀，欺骗模型这是系统通知
-                new_msg["content"] = f"[System Context Info]\n{content_str}\n{log_suffix}"
+                new_msg["content"] = f"[Internal Context: Assistant's previous action]\n{content_str}\n{log_suffix}"
             
-        # 4. Tool 消息处理
+        # 4. Tool 消息处理 (结果反馈)
         if original_role == "tool" or original_role == "function":
             new_msg["role"] = "user"
-            new_msg["content"] = f"[System Log: Execution Result]\n{content_str}"
+            # 明确标记这是原始数据，要求模型阅读但不复述
+            new_msg["content"] = f"[Internal Execution Result - READ ONLY - DO NOT REPEAT]\n{content_str}"
             new_msg.pop("tool_call_id", None)
             new_msg.pop("name", None)
 
@@ -136,7 +133,6 @@ def get_vertex_token() -> str:
     except Exception: return ""
 
 def parse_model_id(model_id: str) -> Tuple[str, Optional[str]]:
-    # === 修复了这里的语法错误 ===
     for suffix, effort in REASONING_LEVELS.items():
         if model_id.endswith(f"-{suffix}"):
             return model_id.rsplit(f"-{suffix}", 1)[0], effort
@@ -154,15 +150,13 @@ async def chat_completions(request: Request):
     try:
         raw_body = await request.json()
         
-        # 1. 角色反转清洗
+        # 1. 角色反转 + 防复读清洗
         body = role_flip_sanitize(raw_body)
         
-        # 强制 Auto
         if "tools" in body and "tool_choice" not in body:
             body["tool_choice"] = "auto"
             
         model_id = body.get("model", "")
-        # 简化 model 解析
         base_model, suffix_effort = parse_model_id(model_id)
         
         vertex_body = body.copy()
