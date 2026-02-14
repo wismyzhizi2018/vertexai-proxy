@@ -349,6 +349,7 @@ openclaw run --model vertexai-proxy/google/gemini-2.5-flash-high --prompt "你�
 | 2026-02-13 | v1.2 | jack-bot | 添加项目背景介绍和方案对比表格 |
 | 2026-02-14 | v19.2 | jack-bot | 修复 SyntaxError，增加 Role Flip (防幻觉) 与 Content Flattener (防400错误)；增强系统指令。 |
 | 2026-02-14 | v20.0 | jack-bot | **Production Ready**: 引入全局 HTTP 连接池提升并发；增加日志截断功能防止 Token 溢出；优化错误处理。 |
+| 2026-02-14 | v21.0 | jack-bot | **Live Stream Monitor**: 新增实时流监控 (首包延迟 TTFT + 传输速率 + 流量统计)；优化连接池配置。 |
 
 ---
 

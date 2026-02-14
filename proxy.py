@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Vertex AI Proxy – v20.0 (Production Ready / 生产环境优化版)
-- 核心继承: v19.2 的 Role-Flip + Flattener 逻辑。
-- 优化 1: 全局 HTTP Client 连接池 (提升并发性能)。
-- 优化 2: 日志截断 (防止 git diff 等长输出撑爆 Token)。
-- 优化 3: 更好的错误日志格式。
+Vertex AI Proxy – v21.0 (Live Stream Monitor / 实时监控版)
+- 核心架构: 基于 v20.0 (Role-Flip + Flattener + Connection Pool)
+- 新增功能: 详细的流式传输日志 (首包时间、传输进度、总流量统计)
+- 目的: 让运维人员直观看到 AI 正在输出，而不是“假死”状态。
 """
 
 import os
 import json
 import subprocess
 import re
+import time
 from typing import Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -26,36 +26,34 @@ http_client: Optional[httpx.AsyncClient] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时初始化连接池
     global http_client
+    # 建立连接池
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(300.0, connect=60.0),
-        limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=120.0),
-        http2=False, # Vertex 偶尔对 HTTP/2 不友好，保持 v1.1
+        limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=120.0),
+        http2=False,
         verify=True
     )
     print("[SYSTEM] Global HTTP Client Initialized.")
     yield
-    # 关闭时清理
     if http_client:
         await http_client.aclose()
         print("[SYSTEM] Global HTTP Client Closed.")
 
-app = FastAPI(title="Vertex AI Proxy v20.0", lifespan=lifespan)
+app = FastAPI(title="Vertex AI Proxy v21.0", lifespan=lifespan)
 
 # ========== 配置 ==========
 VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", "gen-lang-client-0041139433")
 VERTEX_AI_REGION = os.getenv("VERTEX_AI_REGION", "us-west1")
 PROXY_HOST = os.getenv("PROXY_HOST", "127.0.0.1")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8000"))
-# 最大保留的日志长度 (字符数)，约等于 5000-8000 tokens
 MAX_LOG_LENGTH = 30000 
 
 REASONING_LEVELS = {
     "none": "minimal", "low": "low", "medium": "medium", "high": "high"
 }
 
-# ========== 核心：角色反转与清洗 ==========
+# ========== 核心：角色反转与清洗 (保持 v20 逻辑) ==========
 def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
     if "messages" not in body: return body
 
@@ -102,7 +100,6 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
             if "tool_calls" in new_msg:
                 for tc in new_msg["tool_calls"]:
                     fname = tc.get("function", {}).get("name", "tool")
-                    # 仅保留工具名，参数如果太长可以省略，节省 history token
                     log_suffix += f"\n[Log: Tool '{fname}' called]"
                 del new_msg["tool_calls"]
                 should_flip = True
@@ -124,12 +121,11 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
         if original_role == "tool" or original_role == "function":
             new_msg["role"] = "user"
             
-            # --- 优化：日志截断 ---
             if len(content_str) > MAX_LOG_LENGTH:
                 cut_len = len(content_str) - MAX_LOG_LENGTH
                 head = content_str[:MAX_LOG_LENGTH // 2]
                 tail = content_str[-MAX_LOG_LENGTH // 2:]
-                content_str = f"{head}\n\n[...System: Output Truncated ({cut_len} chars removed) to save memory...]\n\n{tail}"
+                content_str = f"{head}\n\n[...System: Output Truncated ({cut_len} chars removed)...]\n\n{tail}"
             
             new_msg["content"] = f"[Internal Execution Result - READ ONLY]\n{content_str}"
             new_msg.pop("tool_call_id", None)
@@ -152,7 +148,6 @@ def get_vertex_token() -> str:
     except Exception: return ""
 
 def parse_model_id(model_id: str) -> Tuple[str, Optional[str]]:
-    # 修复了之前版本的语法错误
     for suffix, effort in REASONING_LEVELS.items():
         if model_id.endswith(f"-{suffix}"):
             return model_id.rsplit(f"-{suffix}", 1)[0], effort
@@ -166,6 +161,9 @@ def get_endpoint_url(base_model: str) -> str:
 # ========== API 端点 ==========
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    request_id = str(int(time.time() * 1000))[-6:] # 简单的请求ID
+    print(f"[{request_id}] New Request Received.")
+    
     try:
         raw_body = await request.json()
         
@@ -186,25 +184,57 @@ async def chat_completions(request: Request):
         token = get_vertex_token()
         headers = { "Authorization": f"Bearer {token}", "Content-Type": "application/json" }
 
-        # 2. 使用全局 Client 发送请求
+        # 2. 发起请求
+        print(f"[{request_id}] Sending to Vertex AI ({base_model})...")
         req = http_client.build_request("POST", endpoint_url + "/chat/completions", json=vertex_body, headers=headers)
+        
+        start_time = time.time()
         response = await http_client.send(req, stream=True)
 
         if response.status_code >= 400:
             err = await response.aread()
-            print(f"[ERROR] {response.status_code}: {err.decode('utf-8', errors='ignore')}")
+            print(f"[{request_id}] [ERROR] Vertex responded {response.status_code}")
             return Response(content=err, status_code=response.status_code)
 
-        async def stream_generator():
+        # 3. 增强的流式监控生成器
+        async def monitored_stream_generator():
+            chunk_count = 0
+            total_bytes = 0
+            first_byte_time = None
+            
             try:
                 async for chunk in response.aiter_bytes():
+                    # 记录首包时间
+                    if chunk_count == 0:
+                        first_byte_time = time.time()
+                        latency_ms = int((first_byte_time - start_time) * 1000)
+                        print(f"[{request_id}] [STREAM START] TTFT: {latency_ms}ms")
+                    
+                    # 传输数据
                     yield chunk
-            except Exception: pass
-            finally: await response.aclose()
+                    
+                    # 统计
+                    chunk_len = len(chunk)
+                    total_bytes += chunk_len
+                    chunk_count += 1
+                    
+                    # 心跳日志 (每50个包或累计一定大小时打印，避免刷屏太快)
+                    if chunk_count % 50 == 0:
+                        print(f"[{request_id}] [STREAMING] > {chunk_count} chunks, {total_bytes/1024:.1f} KB...")
+                        
+            except Exception as e:
+                print(f"[{request_id}] [STREAM ERROR] {e}")
+                raise e
+            finally:
+                await response.aclose()
+                duration = time.time() - start_time
+                speed = (total_bytes / 1024) / duration if duration > 0 else 0
+                print(f"[{request_id}] [STREAM DONE] Total: {total_bytes/1024:.1f} KB in {duration:.2f}s ({speed:.1f} KB/s)")
 
-        return StreamingResponse(stream_generator(), status_code=response.status_code, media_type="text/event-stream")
+        return StreamingResponse(monitored_stream_generator(), status_code=response.status_code, media_type="text/event-stream")
 
     except Exception as e:
+        print(f"[{request_id}] [EXCEPTION] {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
