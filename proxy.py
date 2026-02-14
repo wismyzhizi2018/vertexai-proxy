@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Vertex AI Proxy – v21.0 (Live Stream Monitor / 实时监控版)
-- 核心架构: 基于 v20.0 (Role-Flip + Flattener + Connection Pool)
-- 新增功能: 详细的流式传输日志 (首包时间、传输进度、总流量统计)
-- 目的: 让运维人员直观看到 AI 正在输出，而不是“假死”状态。
+Vertex AI Proxy – v22.0 (Active Reporter / 主动汇报版)
+- 继承: v21.0 的所有底层优化 (HTTP池, 流监控, 防400报错)。
+- 修复: 解决模型"干完活不说话"的问题。
+- 策略: 调整 System Prompt，强制模型在工具执行后必须向用户发送"完成确认"。
 """
 
 import os
@@ -27,7 +27,6 @@ http_client: Optional[httpx.AsyncClient] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_client
-    # 建立连接池
     http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(300.0, connect=60.0),
         limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=120.0),
@@ -40,7 +39,7 @@ async def lifespan(app: FastAPI):
         await http_client.aclose()
         print("[SYSTEM] Global HTTP Client Closed.")
 
-app = FastAPI(title="Vertex AI Proxy v21.0", lifespan=lifespan)
+app = FastAPI(title="Vertex AI Proxy v22.0", lifespan=lifespan)
 
 # ========== 配置 ==========
 VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", "gen-lang-client-0041139433")
@@ -53,21 +52,23 @@ REASONING_LEVELS = {
     "none": "minimal", "low": "low", "medium": "medium", "high": "high"
 }
 
-# ========== 核心：角色反转与清洗 (保持 v20 逻辑) ==========
+# ========== 核心：角色反转与清洗 ==========
 def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
     if "messages" not in body: return body
 
     cleaned_messages = []
     
-    # 系统指令
+    # === 关键修改：更人性化的汇报指令 ===
     system_instruction = {
         "role": "system",
-        "content": """[SYSTEM CRITICAL INSTRUCTION:
+        "content": """[SYSTEM INSTRUCTION:
 1. You are an autonomous Agent.
-2. The '[System Log]' entries in history are INTERNAL execution data for your reference only.
-3. **DO NOT repeat or quote the raw logs to the user.**
-4. **Summarize the result in concise natural language.**
-5. To take action, MUST emit a standard Tool Call object directly.]"""
+2. The '[System Log]' in history represents the OUTPUT of tools you just ran.
+3. **DO NOT repeat the raw logs.** The user cannot read them.
+4. **MANDATORY:** After reading the logs, you **MUST** reply to the user immediately.
+   - If success: Say "Done" or briefly describe what changed (e.g., "Code committed and pushed.").
+   - If error: Briefly explain the error.
+5. **NEVER stay silent** after a tool execution.]"""
     }
     cleaned_messages.append(system_instruction)
 
@@ -117,7 +118,7 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
                 new_msg["role"] = "user"
                 new_msg["content"] = f"[Internal Context: Assistant's previous action]\n{content_str}\n{log_suffix}"
             
-        # 4. Tool 消息处理 (带截断功能)
+        # 4. Tool 消息处理
         if original_role == "tool" or original_role == "function":
             new_msg["role"] = "user"
             
@@ -127,7 +128,9 @@ def role_flip_sanitize(body: Dict[str, Any]) -> Dict[str, Any]:
                 tail = content_str[-MAX_LOG_LENGTH // 2:]
                 content_str = f"{head}\n\n[...System: Output Truncated ({cut_len} chars removed)...]\n\n{tail}"
             
-            new_msg["content"] = f"[Internal Execution Result - READ ONLY]\n{content_str}"
+            # === 关键修改：在日志末尾追加“催促”提示 ===
+            # 这会像有人在背后推了模型一把：“喂，结果出来了，快去告诉用户！”
+            new_msg["content"] = f"[Internal Execution Result - READ ONLY]\n{content_str}\n\n[SYSTEM: Action finished. Please report status to user now.]"
             new_msg.pop("tool_call_id", None)
             new_msg.pop("name", None)
 
@@ -161,7 +164,7 @@ def get_endpoint_url(base_model: str) -> str:
 # ========== API 端点 ==========
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    request_id = str(int(time.time() * 1000))[-6:] # 简单的请求ID
+    request_id = str(int(time.time() * 1000))[-6:]
     print(f"[{request_id}] New Request Received.")
     
     try:
@@ -196,7 +199,7 @@ async def chat_completions(request: Request):
             print(f"[{request_id}] [ERROR] Vertex responded {response.status_code}")
             return Response(content=err, status_code=response.status_code)
 
-        # 3. 增强的流式监控生成器
+        # 3. 流式监控
         async def monitored_stream_generator():
             chunk_count = 0
             total_bytes = 0
@@ -204,23 +207,19 @@ async def chat_completions(request: Request):
             
             try:
                 async for chunk in response.aiter_bytes():
-                    # 记录首包时间
                     if chunk_count == 0:
                         first_byte_time = time.time()
                         latency_ms = int((first_byte_time - start_time) * 1000)
                         print(f"[{request_id}] [STREAM START] TTFT: {latency_ms}ms")
                     
-                    # 传输数据
                     yield chunk
                     
-                    # 统计
                     chunk_len = len(chunk)
                     total_bytes += chunk_len
                     chunk_count += 1
                     
-                    # 心跳日志 (每50个包或累计一定大小时打印，避免刷屏太快)
                     if chunk_count % 50 == 0:
-                        print(f"[{request_id}] [STREAMING] > {chunk_count} chunks, {total_bytes/1024:.1f} KB...")
+                        print(f"[{request_id}] [STREAMING] > {chunk_count} chunks...")
                         
             except Exception as e:
                 print(f"[{request_id}] [STREAM ERROR] {e}")
@@ -228,8 +227,7 @@ async def chat_completions(request: Request):
             finally:
                 await response.aclose()
                 duration = time.time() - start_time
-                speed = (total_bytes / 1024) / duration if duration > 0 else 0
-                print(f"[{request_id}] [STREAM DONE] Total: {total_bytes/1024:.1f} KB in {duration:.2f}s ({speed:.1f} KB/s)")
+                print(f"[{request_id}] [STREAM DONE] Total: {total_bytes/1024:.1f} KB in {duration:.2f}s")
 
         return StreamingResponse(monitored_stream_generator(), status_code=response.status_code, media_type="text/event-stream")
 
