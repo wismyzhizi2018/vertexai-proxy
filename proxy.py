@@ -67,6 +67,10 @@ CACHE_MAX_ENTRIES  = 2000
 TOKEN_REFRESH_SECS = 1800
 CACHE_DB_PATH      = os.getenv("CACHE_DB_PATH", "/var/lib/vertexai-proxy/sig_cache.db")
 
+ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_URL  = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION  = "2023-06-01"
+
 REASONING_LEVELS = {"none": "minimal", "low": "low", "medium": "medium", "high": "high"}
 
 AGENT_SYSTEM_INSTRUCTION = (
@@ -372,11 +376,12 @@ def sanitize_and_restore(body: Dict[str, Any], req_id: str, ns: str) -> Dict[str
     body["messages"] = cleaned
 
     # ── 全局签名广播（第二阶段）──────────────────────────────────────────
-    # 场景：代理重启后，早期历史 tool_call_id 的签名不在内存缓存中，
-    # 但消息链里其他轮次已有签名。
-    # 策略：从整条链收集任意一个有效签名，广播给所有仍缺签名的 tool_call。
-    # 依据：Vertex 只验证签名字段存在，不验证签名与具体 tool_call 的绑定关系。
+    # 策略1：从消息链中找任意已有签名广播给所有缺口
+    # 策略2：链中全部是孤儿时（切换模型/新会话），从 DB 取该用户最近一条签名兜底
+    # 依据：Vertex 只验证签名字段存在，不验证签名与具体 tool_call 的绑定关系
     global_sig: Optional[str] = None
+
+    # 策略1：链内查找
     for msg in cleaned:
         if msg.get("role") != "model":
             continue
@@ -387,6 +392,31 @@ def sanitize_and_restore(body: Dict[str, Any], req_id: str, ns: str) -> Dict[str
                 break
         if global_sig:
             break
+
+    # 策略2：链内无签名时，从 DB 取该用户任意最近签名（切换模型/新会话场景）
+    if not global_sig:
+        cutoff = time.time() - CACHE_TTL_SECONDS
+        with _db_lock:
+            row = _get_db().execute(
+                "SELECT sig FROM sig_cache WHERE ns=? AND ts>? ORDER BY ts DESC LIMIT 1",
+                (ns, cutoff)
+            ).fetchone()
+        if row:
+            global_sig = row[0]
+            print(f"[{req_id}] [SIG] ↗ Fallback: using own DB signature for ns={ns}")
+
+    # 策略3：该用户 DB 也没有（首次使用思考模型）→ 借用全局任意最近签名
+    # Vertex 只验证签名存在，不验证归属，跨用户借用安全
+    if not global_sig:
+        cutoff = time.time() - CACHE_TTL_SECONDS
+        with _db_lock:
+            row = _get_db().execute(
+                "SELECT sig FROM sig_cache WHERE ts>? ORDER BY ts DESC LIMIT 1",
+                (cutoff,)
+            ).fetchone()
+        if row:
+            global_sig = row[0]
+            print(f"[{req_id}] [SIG] ↗ Fallback: using global DB signature (no own sig found)")
 
     if global_sig:
         filled = 0
@@ -489,13 +519,18 @@ async def chat_completions(request: Request):
     req_id = str(int(time.time() * 1000))[-6:]
     print(f"[{req_id}] ← Request")
 
-    # 用户命名空间：Authorization header 的 SHA256 前16位
-    # 无 header 时用 "anonymous"（单用户/内网场景兜底）
     auth_header = request.headers.get("Authorization", "")
     ns = _user_ns(auth_header) if auth_header else "anonymous"
 
     try:
         raw_body = await request.json()
+        model_id = raw_body.get("model", "")
+
+        # ── 路由分流：claude-* → Anthropic，其余 → Vertex AI ──────────────
+        if model_id.startswith("anthropic/") or model_id.startswith("claude-"):
+            return await _forward_anthropic(raw_body, req_id)
+
+        # ── Vertex AI 路径（原有逻辑）─────────────────────────────────────
         body = sanitize_and_restore(raw_body, req_id, ns)
 
         if "tools" in body and "tool_choice" not in body:
@@ -530,7 +565,7 @@ async def chat_completions(request: Request):
                             media_type="application/json")
 
         return StreamingResponse(
-            stream_and_cache(resp, req_id, start, ns),   # ← 传入 ns
+            stream_and_cache(resp, req_id, start, ns),
             status_code=resp.status_code,
             media_type="text/event-stream",
         )
@@ -540,6 +575,190 @@ async def chat_completions(request: Request):
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(500, str(e))
+
+
+async def _forward_anthropic(body: dict, req_id: str):
+    """将 OpenAI 格式请求转换为 Anthropic Messages API 格式并透传响应"""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY not configured")
+
+    # ── OpenAI → Anthropic 格式转换 ──────────────────────────────────────
+    model_id = body.get("model", "").replace("anthropic/", "")
+    messages  = body.get("messages", [])
+    stream    = body.get("stream", False)
+
+    # 分离 system prompt
+    system_prompt = ""
+    filtered_msgs = []
+    for m in messages:
+        if m.get("role") in ("system", "developer"):
+            system_prompt += m.get("content", "") + "\n"
+        else:
+            filtered_msgs.append(m)
+
+    # 转换 tool_calls（OpenAI → Anthropic 格式）
+    anthropic_msgs = []
+    for m in filtered_msgs:
+        role = m.get("role")
+        if role == "assistant":
+            content = []
+            text = m.get("content") or ""
+            if text:
+                content.append({"type": "text", "text": text})
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function", {})
+                args = fn.get("arguments", "{}")
+                try:
+                    args = json.loads(args) if isinstance(args, str) else args
+                except Exception:
+                    args = {}
+                content.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "input": args,
+                })
+            anthropic_msgs.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            anthropic_msgs.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": m.get("tool_call_id", ""),
+                    "content": m.get("content", ""),
+                }]
+            })
+        else:
+            anthropic_msgs.append({"role": role, "content": m.get("content", "")})
+
+    # 转换 tools
+    anthropic_tools = []
+    for t in (body.get("tools") or []):
+        fn = t.get("function", {})
+        anthropic_tools.append({
+            "name": fn.get("name"),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+        })
+
+    anthropic_body: Dict[str, Any] = {
+        "model": model_id,
+        "max_tokens": body.get("max_tokens", 8192),
+        "messages": anthropic_msgs,
+        "stream": stream,
+    }
+    if system_prompt.strip():
+        anthropic_body["system"] = system_prompt.strip()
+    if anthropic_tools:
+        anthropic_body["tools"] = anthropic_tools
+    if body.get("temperature") is not None:
+        anthropic_body["temperature"] = body["temperature"]
+
+    print(f"[{req_id}] → Anthropic ({model_id}) stream={stream}")
+    start = time.time()
+
+    req_obj = http_client.build_request(
+        "POST",
+        ANTHROPIC_API_URL,
+        json=anthropic_body,
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "Content-Type": "application/json",
+        },
+    )
+    resp = await http_client.send(req_obj, stream=True)
+
+    if resp.status_code >= 400:
+        err = await resp.aread()
+        print(f"[{req_id}] [ERROR] Anthropic {resp.status_code}: {err[:500]}")
+        return Response(content=err, status_code=resp.status_code,
+                        media_type="application/json")
+
+    if not stream:
+        # 非流式：Anthropic → OpenAI 格式转换后返回
+        data = await resp.aread()
+        try:
+            ar = json.loads(data)
+            content_blocks = ar.get("content", [])
+            text = " ".join(b.get("text","") for b in content_blocks if b.get("type")=="text")
+            tool_calls = []
+            for b in content_blocks:
+                if b.get("type") == "tool_use":
+                    tool_calls.append({
+                        "id": b["id"], "type": "function",
+                        "function": {"name": b["name"], "arguments": json.dumps(b.get("input",{}))}
+                    })
+            oai_resp = {
+                "id": ar.get("id",""),
+                "object": "chat.completion",
+                "model": model_id,
+                "choices": [{"index":0,"message":{"role":"assistant","content":text or None,
+                    "tool_calls": tool_calls or None},"finish_reason": ar.get("stop_reason","stop")}],
+                "usage": {"prompt_tokens": ar.get("usage",{}).get("input_tokens",0),
+                          "completion_tokens": ar.get("usage",{}).get("output_tokens",0),
+                          "total_tokens": 0}
+            }
+            duration = time.time() - start
+            print(f"[{req_id}] [DONE] Anthropic non-stream in {duration:.2f}s")
+            return Response(content=json.dumps(oai_resp), media_type="application/json")
+        except Exception as e:
+            return Response(content=data, status_code=200, media_type="application/json")
+
+    # 流式：Anthropic SSE → OpenAI SSE 格式转换
+    async def convert_anthropic_stream(resp, req_id, start):
+        first = True
+        try:
+            async for chunk in resp.aiter_bytes():
+                if first:
+                    print(f"[{req_id}] [TTFT] {int((time.time()-start)*1000)}ms")
+                    first = False
+                lines = chunk.decode("utf-8", errors="replace").split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        ev = json.loads(data)
+                        ev_type = ev.get("type","")
+
+                        # Anthropic SSE → OpenAI SSE 映射
+                        if ev_type == "content_block_delta":
+                            delta = ev.get("delta",{})
+                            if delta.get("type") == "text_delta":
+                                oai = {"choices":[{"delta":{"content":delta.get("text","")},"index":0}]}
+                                yield f"data: {json.dumps(oai)}\n\n".encode()
+                            elif delta.get("type") == "input_json_delta":
+                                oai = {"choices":[{"delta":{"tool_calls":[{"index":ev.get("index",0),
+                                    "function":{"arguments":delta.get("partial_json","")}}]},"index":0}]}
+                                yield f"data: {json.dumps(oai)}\n\n".encode()
+                        elif ev_type == "content_block_start":
+                            block = ev.get("content_block",{})
+                            if block.get("type") == "tool_use":
+                                oai = {"choices":[{"delta":{"tool_calls":[{
+                                    "index": ev.get("index",0),
+                                    "id": block.get("id",""),
+                                    "type":"function",
+                                    "function":{"name":block.get("name",""),"arguments":""}
+                                }]},"index":0}]}
+                                yield f"data: {json.dumps(oai)}\n\n".encode()
+                        elif ev_type == "message_stop":
+                            yield b"data: [DONE]\n\n"
+                    except Exception:
+                        pass
+        finally:
+            await resp.aclose()
+            duration = time.time() - start
+            print(f"[{req_id}] [DONE] Anthropic stream in {duration:.2f}s")
+
+    return StreamingResponse(
+        convert_anthropic_stream(resp, req_id, start),
+        status_code=200,
+        media_type="text/event-stream",
+    )
 
 # ═══════════════════════════════════════════════════════════════
 #  健康检查
