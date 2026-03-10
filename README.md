@@ -19,6 +19,9 @@
 
 为解决上述痛点，**VertexAI-Proxy** 应运而生。它基于 Google Cloud 企业级 AI 平台 Vertex AI，为 Gemini 模型提供稳定、高效、低限制的代理接入方案，显著提升服务可靠性与部署灵活性。
 
+**核心特性：**
+- **SQLite 持久化**：内置 SQLite 数据库，用于持久化存储签名与状态，彻底解决代理重启后签名丢失的问题，保障服务连续性。
+
 ### 📊 方案对比
 
 | 对比维度 | Gemini CLI / 公共 API | VertexAI-Proxy (Vertex AI) |
