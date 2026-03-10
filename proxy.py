@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-I Proxy – v29.0 (生产就绪版)
+Vertex AI Proxy – v29.0 (生产就绪版)
 
 修复历程总结：
   v22  原始版本，工具调用链断裂 + 幻觉问题
@@ -769,13 +769,20 @@ async def _forward_anthropic(body: dict, req_id: str):
     extra_betas = []
     if model_id in _CLAUDE4_ADAPTIVE_MODELS:
         extra_betas.append("output-128k-2025-02-19")     # 128K 输出
-        extra_betas.append("interleaved-thinking-2025-05-14")  # sonnet-4-6 需要；opus-4-6 忽略但无害
+    # interleaved-thinking: opus-4-6 上已废弃，仅 sonnet-4-6 手动 extended thinking 时需要
+    if model_id == "claude-sonnet-4-6" and not thinking_enabled:
+        extra_betas.append("interleaved-thinking-2025-05-14")
 
     # 客户端通过 max_context=1m 或 contextWindow>=500000 触发 1M beta
     if (body.get("max_context") == "1m"
             or (body.get("contextWindow", 0) >= 500_000)
             or body.get("enable_1m_context")):
-        extra_betas.append("1m-context-2025-05-01")
+        extra_betas.append("context-1m-2025-08-07")
+
+    # Fast mode: opus-4-6 专属，速度提升 2.5x
+    if body.get("speed") == "fast" and model_id == "claude-opus-4-6":
+        extra_betas.append("fast-mode-2026-02-01")
+        anthropic_body["speed"] = "fast"
 
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,

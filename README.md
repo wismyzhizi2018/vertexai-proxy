@@ -213,7 +213,7 @@ systemctl status vertexai-proxy
           "id": "anthropic/claude-sonnet-4-6",
           "name": "Claude Sonnet 4.6",
           "reasoning": true,
-          "input": ["text"],
+          "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 200000,
           "maxTokens": 64000
@@ -222,7 +222,7 @@ systemctl status vertexai-proxy
           "id": "anthropic/claude-opus-4-6",
           "name": "Claude Opus 4.6 (200K)",
           "reasoning": true,
-          "input": ["text"],
+          "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 200000,
           "maxTokens": 128000
@@ -231,7 +231,7 @@ systemctl status vertexai-proxy
           "id": "anthropic/claude-opus-4-6",
           "name": "Claude Opus 4.6 (1M Beta)",
           "reasoning": true,
-          "input": ["text"],
+          "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 1000000,
           "maxTokens": 128000
@@ -240,7 +240,7 @@ systemctl status vertexai-proxy
           "id": "anthropic/claude-opus-4-5",
           "name": "Claude Opus 4.5",
           "reasoning": true,
-          "input": ["text"],
+          "input": ["text", "image"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 200000,
           "maxTokens": 8192
