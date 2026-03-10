@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Vertex AI Proxy – v26.0 (生产就绪版)
+I Proxy – v29.0 (生产就绪版)
 
 修复历程总结：
   v22  原始版本，工具调用链断裂 + 幻觉问题
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
         _db_conn.close()
         print("[SYSTEM] SQLite cache closed.")
 
-app = FastAPI(title="Vertex AI Proxy v27.0", lifespan=lifespan)
+app = FastAPI(title="Vertex AI Proxy v29.0", lifespan=lifespan)
 
 # ═══════════════════════════════════════════════════════════════
 #  配置
@@ -577,6 +577,12 @@ async def chat_completions(request: Request):
         raise HTTPException(500, str(e))
 
 
+# Claude 4.x 模型：opus-4-6/sonnet-4-6 用 adaptive thinking + effort
+# opus-4-5/sonnet-4-5 用旧的 budget_tokens 方式
+_CLAUDE4_ADAPTIVE_MODELS = {"claude-opus-4-6", "claude-sonnet-4-6"}
+_CLAUDE4_BUDGET_MODELS   = {"claude-opus-4-5", "claude-sonnet-4-5"}
+_CLAUDE4_THINKING_MODELS = _CLAUDE4_ADAPTIVE_MODELS | _CLAUDE4_BUDGET_MODELS
+
 async def _forward_anthropic(body: dict, req_id: str):
     """将 OpenAI 格式请求转换为 Anthropic Messages API 格式并透传响应"""
     if not ANTHROPIC_API_KEY:
@@ -587,49 +593,102 @@ async def _forward_anthropic(body: dict, req_id: str):
     messages  = body.get("messages", [])
     stream    = body.get("stream", False)
 
-    # 分离 system prompt
-    system_prompt = ""
+    # 分离 system prompt（支持多条 system 消息合并）
+    system_blocks = []
     filtered_msgs = []
     for m in messages:
         if m.get("role") in ("system", "developer"):
-            system_prompt += m.get("content", "") + "\n"
+            text = m.get("content", "")
+            if isinstance(text, list):
+                # content 可能是 block 数组
+                text = " ".join(b.get("text","") for b in text if b.get("type")=="text")
+            if text:
+                system_blocks.append(text)
         else:
             filtered_msgs.append(m)
 
-    # 转换 tool_calls（OpenAI → Anthropic 格式）
-    anthropic_msgs = []
+    # BUG FIX 1: 合并相邻同 role 消息
+    # Anthropic 不允许连续两条相同 role，需要合并
+    merged_msgs = []
     for m in filtered_msgs:
         role = m.get("role")
+        content = m.get("content", "")
+        tool_calls = m.get("tool_calls")
+        tool_call_id = m.get("tool_call_id")
+        if (merged_msgs and merged_msgs[-1]["_role"] == role
+                and role in ("user", "assistant") and not tool_call_id and not tool_calls):
+            # 合并连续同 role 消息（Anthropic 不允许连续相同 role）
+            prev = merged_msgs[-1]
+            new_text = content or ""
+            if isinstance(prev["_content"], list):
+                prev["_content"].append({"type": "text", "text": new_text})
+            else:
+                prev["_content"] = (prev["_content"] or "") + ("\n" + new_text if new_text else "")
+        else:
+            merged_msgs.append({"_role": role, "_content": content,
+                                 "_tool_calls": tool_calls, "_tool_call_id": tool_call_id,
+                                 "_name": m.get("name")})
+
+    # 转换 tool_calls（OpenAI → Anthropic 格式）
+    anthropic_msgs = []
+    for m in merged_msgs:
+        role = m["_role"]
+        content = m["_content"]
+        tool_calls = m["_tool_calls"]
+        tool_call_id = m["_tool_call_id"]
+
         if role == "assistant":
-            content = []
-            text = m.get("content") or ""
-            if text:
-                content.append({"type": "text", "text": text})
-            for tc in (m.get("tool_calls") or []):
+            blocks = []
+            # BUG FIX 2: content 可能是 list（某些客户端发 block 数组）
+            if isinstance(content, list):
+                for b in content:
+                    if b.get("type") == "text" and b.get("text"):
+                        blocks.append({"type": "text", "text": b["text"]})
+            elif content:
+                blocks.append({"type": "text", "text": content})
+            for tc in (tool_calls or []):
                 fn = tc.get("function", {})
                 args = fn.get("arguments", "{}")
                 try:
                     args = json.loads(args) if isinstance(args, str) else args
                 except Exception:
                     args = {}
-                content.append({
+                blocks.append({
                     "type": "tool_use",
                     "id": tc.get("id", ""),
                     "name": fn.get("name", ""),
                     "input": args,
                 })
-            anthropic_msgs.append({"role": "assistant", "content": content})
+            # BUG FIX 3: assistant content 不能为空数组
+            if not blocks:
+                blocks.append({"type": "text", "text": ""})
+            anthropic_msgs.append({"role": "assistant", "content": blocks})
+
         elif role == "tool":
-            anthropic_msgs.append({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": m.get("tool_call_id", ""),
-                    "content": m.get("content", ""),
-                }]
-            })
+            # BUG FIX 4: 多个 tool result 应合并到同一个 user 消息
+            tool_result = {
+                "type": "tool_result",
+                "tool_use_id": tool_call_id or "",
+                "content": content or "",
+            }
+            # 如果上一条已经是 tool_result user 消息，追加进去
+            if (anthropic_msgs and anthropic_msgs[-1]["role"] == "user"
+                    and isinstance(anthropic_msgs[-1]["content"], list)
+                    and any(b.get("type") == "tool_result" for b in anthropic_msgs[-1]["content"])):
+                anthropic_msgs[-1]["content"].append(tool_result)
+            else:
+                anthropic_msgs.append({"role": "user", "content": [tool_result]})
+
         else:
-            anthropic_msgs.append({"role": role, "content": m.get("content", "")})
+            # user 消息：content 可能是 list
+            if isinstance(content, list):
+                anthropic_msgs.append({"role": role, "content": content})
+            else:
+                anthropic_msgs.append({"role": role, "content": content or ""})
+
+    # BUG FIX 5: 确保第一条消息是 user（Anthropic 要求）
+    if anthropic_msgs and anthropic_msgs[0]["role"] != "user":
+        anthropic_msgs.insert(0, {"role": "user", "content": "."})
 
     # 转换 tools
     anthropic_tools = []
@@ -641,31 +700,96 @@ async def _forward_anthropic(body: dict, req_id: str):
             "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
         })
 
+    # 转换 tool_choice
+    anthropic_tool_choice = None
+    tc_raw = body.get("tool_choice")
+    if tc_raw == "auto":
+        anthropic_tool_choice = {"type": "auto"}
+    elif tc_raw == "none":
+        anthropic_tool_choice = None  # Anthropic 不支持 none，直接不传 tools
+    elif isinstance(tc_raw, dict) and tc_raw.get("type") == "function":
+        anthropic_tool_choice = {"type": "tool", "name": tc_raw["function"]["name"]}
+
     anthropic_body: Dict[str, Any] = {
         "model": model_id,
         "max_tokens": body.get("max_tokens", 8192),
         "messages": anthropic_msgs,
         "stream": stream,
     }
-    if system_prompt.strip():
-        anthropic_body["system"] = system_prompt.strip()
-    if anthropic_tools:
+    if system_blocks:
+        anthropic_body["system"] = "\n".join(system_blocks).strip()
+    # tool_choice=none 时不传 tools（Anthropic 无 none 类型）
+    if anthropic_tools and tc_raw != "none":
         anthropic_body["tools"] = anthropic_tools
-    if body.get("temperature") is not None:
-        anthropic_body["temperature"] = body["temperature"]
+    if anthropic_tool_choice and anthropic_tools and tc_raw != "none":
+        anthropic_body["tool_choice"] = anthropic_tool_choice
+    # Claude 4.x 扩展思考
+    # opus-4-6/sonnet-4-6: adaptive thinking + effort（budget_tokens 已废弃）
+    # opus-4-5/sonnet-4-5: 旧版 enabled + budget_tokens
+    reasoning_effort = body.get("reasoning_effort")
+    thinking_enabled = False
 
-    print(f"[{req_id}] → Anthropic ({model_id}) stream={stream}")
+    if model_id in _CLAUDE4_ADAPTIVE_MODELS and reasoning_effort and reasoning_effort != "none":
+        # 新模型：用 adaptive + effort 参数
+        # effort: low/medium/high/max（max 是 opus-4-6 新增）
+        effort_map = {"low": "low", "medium": "medium", "high": "high", "max": "max"}
+        effort = effort_map.get(reasoning_effort, "high")
+        anthropic_body["thinking"] = {"type": "adaptive"}
+        anthropic_body["effort"] = effort
+        # adaptive 模式 max_tokens 建议 >= 16000
+        if anthropic_body["max_tokens"] < 16000:
+            anthropic_body["max_tokens"] = 16000
+        thinking_enabled = True
+
+    elif model_id in _CLAUDE4_BUDGET_MODELS and reasoning_effort and reasoning_effort != "none":
+        # 旧模型：用 enabled + budget_tokens
+        budget_map = {"low": 2000, "medium": 8000, "high": 16000}
+        budget = budget_map.get(reasoning_effort, 8000)
+        anthropic_body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        if anthropic_body["max_tokens"] <= budget:
+            anthropic_body["max_tokens"] = budget + 4096
+        thinking_enabled = True
+
+    # temperature/top_p: 扩展思考模式下不能传（会 400）
+    if not thinking_enabled:
+        if body.get("temperature") is not None:
+            anthropic_body["temperature"] = body["temperature"]
+        if body.get("top_p") is not None:
+            anthropic_body["top_p"] = body["top_p"]
+
+    if body.get("stop") is not None:
+        stop = body["stop"]
+        anthropic_body["stop_sequences"] = [stop] if isinstance(stop, str) else stop
+
+    print(f"[{req_id}] → Anthropic ({model_id}) msgs={len(anthropic_msgs)} "
+          f"stream={stream} thinking={thinking_enabled}")
     start = time.time()
+
+    # opus-4-6 / sonnet-4-6 支持 1M context（beta），自动启用
+    extra_betas = []
+    if model_id in _CLAUDE4_ADAPTIVE_MODELS:
+        extra_betas.append("output-128k-2025-02-19")     # 128K 输出
+        extra_betas.append("interleaved-thinking-2025-05-14")  # sonnet-4-6 需要；opus-4-6 忽略但无害
+
+    # 客户端通过 max_context=1m 或 contextWindow>=500000 触发 1M beta
+    if (body.get("max_context") == "1m"
+            or (body.get("contextWindow", 0) >= 500_000)
+            or body.get("enable_1m_context")):
+        extra_betas.append("1m-context-2025-05-01")
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "Content-Type": "application/json",
+    }
+    if extra_betas:
+        headers["anthropic-beta"] = ",".join(extra_betas)
 
     req_obj = http_client.build_request(
         "POST",
         ANTHROPIC_API_URL,
         json=anthropic_body,
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "Content-Type": "application/json",
-        },
+        headers=headers,
     )
     resp = await http_client.send(req_obj, stream=True)
 
@@ -681,40 +805,64 @@ async def _forward_anthropic(body: dict, req_id: str):
         try:
             ar = json.loads(data)
             content_blocks = ar.get("content", [])
-            text = " ".join(b.get("text","") for b in content_blocks if b.get("type")=="text")
+            # 过滤 thinking block（扩展思考内容不透传给客户端）
+            # 多段 text 换行拼接
+            text = "\n".join(b.get("text","") for b in content_blocks
+                             if b.get("type")=="text" and b.get("text"))
             tool_calls = []
             for b in content_blocks:
+                if b.get("type") == "thinking":
+                    continue  # 跳过思考块
                 if b.get("type") == "tool_use":
                     tool_calls.append({
                         "id": b["id"], "type": "function",
-                        "function": {"name": b["name"], "arguments": json.dumps(b.get("input",{}))}
+                        "function": {"name": b["name"],
+                                     "arguments": json.dumps(b.get("input",{}), ensure_ascii=False)}
                     })
+            # stop_reason 映射
+            stop_reason = ar.get("stop_reason", "stop")
+            finish_reason = "tool_calls" if stop_reason == "tool_use" else "stop"
             oai_resp = {
                 "id": ar.get("id",""),
                 "object": "chat.completion",
                 "model": model_id,
-                "choices": [{"index":0,"message":{"role":"assistant","content":text or None,
-                    "tool_calls": tool_calls or None},"finish_reason": ar.get("stop_reason","stop")}],
-                "usage": {"prompt_tokens": ar.get("usage",{}).get("input_tokens",0),
-                          "completion_tokens": ar.get("usage",{}).get("output_tokens",0),
-                          "total_tokens": 0}
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": text or None,
+                        "tool_calls": tool_calls or None,
+                    },
+                    "finish_reason": finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": ar.get("usage",{}).get("input_tokens", 0),
+                    "completion_tokens": ar.get("usage",{}).get("output_tokens", 0),
+                    "total_tokens": (ar.get("usage",{}).get("input_tokens", 0)
+                                     + ar.get("usage",{}).get("output_tokens", 0)),
+                }
             }
             duration = time.time() - start
             print(f"[{req_id}] [DONE] Anthropic non-stream in {duration:.2f}s")
-            return Response(content=json.dumps(oai_resp), media_type="application/json")
+            return Response(content=json.dumps(oai_resp, ensure_ascii=False),
+                            media_type="application/json")
         except Exception as e:
+            print(f"[{req_id}] [ERROR] Anthropic response parse: {e}")
             return Response(content=data, status_code=200, media_type="application/json")
 
     # 流式：Anthropic SSE → OpenAI SSE 格式转换
     async def convert_anthropic_stream(resp, req_id, start):
         first = True
+        buffer = ""  # 跨 chunk 的不完整 SSE 行缓冲
         try:
             async for chunk in resp.aiter_bytes():
                 if first:
                     print(f"[{req_id}] [TTFT] {int((time.time()-start)*1000)}ms")
                     first = False
-                lines = chunk.decode("utf-8", errors="replace").split("\n")
-                for line in lines:
+                # BUG FIX 7: SSE 行可能跨 chunk，需要缓冲
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
                     line = line.strip()
                     if not line.startswith("data:"):
                         continue
@@ -725,28 +873,44 @@ async def _forward_anthropic(body: dict, req_id: str):
                         ev = json.loads(data)
                         ev_type = ev.get("type","")
 
-                        # Anthropic SSE → OpenAI SSE 映射
                         if ev_type == "content_block_delta":
                             delta = ev.get("delta",{})
-                            if delta.get("type") == "text_delta":
+                            if delta.get("type") == "thinking_delta":
+                                pass  # 过滤扩展思考内容，不透传给客户端
+                            elif delta.get("type") == "text_delta":
                                 oai = {"choices":[{"delta":{"content":delta.get("text","")},"index":0}]}
-                                yield f"data: {json.dumps(oai)}\n\n".encode()
+                                yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
                             elif delta.get("type") == "input_json_delta":
-                                oai = {"choices":[{"delta":{"tool_calls":[{"index":ev.get("index",0),
-                                    "function":{"arguments":delta.get("partial_json","")}}]},"index":0}]}
+                                oai = {"choices":[{"delta":{"tool_calls":[{
+                                    "index": ev.get("index", 0),
+                                    "function":{"arguments":delta.get("partial_json","")}}
+                                ]},"index":0}]}
                                 yield f"data: {json.dumps(oai)}\n\n".encode()
+
                         elif ev_type == "content_block_start":
                             block = ev.get("content_block",{})
-                            if block.get("type") == "tool_use":
+                            if block.get("type") == "thinking":
+                                pass  # 过滤扩展思考 block
+                            elif block.get("type") == "tool_use":
                                 oai = {"choices":[{"delta":{"tool_calls":[{
-                                    "index": ev.get("index",0),
+                                    "index": ev.get("index", 0),
                                     "id": block.get("id",""),
-                                    "type":"function",
-                                    "function":{"name":block.get("name",""),"arguments":""}
+                                    "type": "function",
+                                    "function": {"name": block.get("name",""), "arguments":""}
                                 }]},"index":0}]}
                                 yield f"data: {json.dumps(oai)}\n\n".encode()
+
+                        elif ev_type == "message_delta":
+                            # BUG FIX 8: 补发 finish_reason
+                            delta = ev.get("delta", {})
+                            stop_reason = delta.get("stop_reason","")
+                            finish = "tool_calls" if stop_reason == "tool_use" else "stop"
+                            oai = {"choices":[{"delta":{},"index":0,"finish_reason": finish}]}
+                            yield f"data: {json.dumps(oai)}\n\n".encode()
+
                         elif ev_type == "message_stop":
                             yield b"data: [DONE]\n\n"
+
                     except Exception:
                         pass
         finally:
@@ -775,7 +939,7 @@ async def health():
         total_sigs = active_ns = -1
     return {
         "status":            "ok",
-        "version":           "v28.0",
+        "version":           "v29.0",
         "active_namespaces": active_ns,
         "cached_signatures": total_sigs,
         "cache_db":          CACHE_DB_PATH,
