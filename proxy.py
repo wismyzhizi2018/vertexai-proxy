@@ -62,7 +62,7 @@ VERTEX_AI_REGION   = os.getenv("VERTEX_AI_REGION", "us-west1")
 PROXY_HOST         = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT         = int(os.getenv("PROXY_PORT", "8000"))
 MAX_TOOL_CONTENT   = 30_000
-CACHE_TTL_SECONDS  = 3600
+CACHE_TTL_SECONDS  = 86400   # 24小时（原1小时太短，长任务会过期）
 CACHE_MAX_ENTRIES  = 2000
 TOKEN_REFRESH_SECS = 1800
 CACHE_DB_PATH      = os.getenv("CACHE_DB_PATH", "/var/lib/vertexai-proxy/sig_cache.db")
@@ -472,6 +472,10 @@ async def stream_and_cache(response: httpx.Response, req_id: str, start: float, 
     count = total = 0
     collected: List[bytes] = []
     first = False
+    # 流式实时写：收到签名立刻写 DB，不等 finally（修复 race condition）
+    live_sigs: Dict[str, str] = {}   # {tc_id: sig} 流中已发现的
+    live_ids:  List[str]      = []   # 流中所有 tc_id（含无签名的）
+    live_tc_map: Dict[int, Dict] = {}  # index → {id, sig}
 
     try:
         async for chunk in response.aiter_bytes():
@@ -485,6 +489,40 @@ async def stream_and_cache(response: httpx.Response, req_id: str, start: float, 
             if count % 100 == 0:
                 print(f"[{req_id}] [STREAM] {count} chunks / {total/1024:.1f} KB")
 
+            # 实时解析当前 chunk，发现新签名立即写 DB
+            for line in chunk.decode("utf-8", errors="replace").splitlines():
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(data_str)
+                except Exception:
+                    continue
+                delta = ((data.get("choices") or [{}])[0]).get("delta") or {}
+                for tc_delta in delta.get("tool_calls") or []:
+                    idx = tc_delta.get("index", 0)
+                    if idx not in live_tc_map:
+                        live_tc_map[idx] = {"id": "", "sig": ""}
+                    entry = live_tc_map[idx]
+                    if tc_delta.get("id") and not entry["id"]:
+                        entry["id"] = tc_delta["id"]
+                        if entry["id"] not in live_ids:
+                            live_ids.append(entry["id"])
+                    extra  = tc_delta.get("extra_content") or {}
+                    google = extra.get("google") or {}
+                    sig = (google.get("thought_signature")
+                           or tc_delta.get("thought_signature")
+                           or (tc_delta.get("function") or {}).get("thought_signature")
+                           or "")
+                    if sig:
+                        entry["sig"] += sig
+                        tc_id = entry["id"]
+                        if tc_id and tc_id not in live_sigs:
+                            live_sigs[tc_id] = entry["sig"]
+                            sig_cache_put(ns, tc_id, entry["sig"])  # 立即写 DB
+
     except Exception as e:
         print(f"[{req_id}] [ERROR] Stream error: {e}")
         raise
@@ -496,20 +534,17 @@ async def stream_and_cache(response: httpx.Response, req_id: str, start: float, 
         if not collected:
             return
 
-        sigs, all_ids = parse_stream_tool_calls(collected)
-
-        # 广播：同批内有签名的补给无签名的
-        if sigs and all_ids:
-            any_sig = next(iter(sigs.values()))
-            for tc_id in all_ids:
-                if tc_id not in sigs:
-                    sigs[tc_id] = any_sig
+        # finally 阶段：广播（同批内有签名的补给无签名的）并补写 DB
+        if live_sigs and live_ids:
+            any_sig = next(iter(live_sigs.values()))
+            for tc_id in live_ids:
+                if tc_id not in live_sigs:
+                    live_sigs[tc_id] = any_sig
+                    sig_cache_put(ns, tc_id, any_sig)
                     print(f"[{req_id}] [SIG] ↗ Broadcast to id={tc_id}")
 
-        if sigs:
-            for tc_id, sig in sigs.items():
-                sig_cache_put(ns, tc_id, sig)   # ← ns 隔离写入
-            print(f"[{req_id}] [SIG] Cached {len(sigs)} signature(s)")
+        if live_sigs:
+            print(f"[{req_id}] [SIG] Cached {len(live_sigs)} signature(s)")
 
 # ═══════════════════════════════════════════════════════════════
 #  API 端点
@@ -680,9 +715,40 @@ async def _forward_anthropic(body: dict, req_id: str):
                 anthropic_msgs.append({"role": "user", "content": [tool_result]})
 
         else:
-            # user 消息：content 可能是 list
+            # user 消息：content 可能是 list（含图片 block）
             if isinstance(content, list):
-                anthropic_msgs.append({"role": role, "content": content})
+                converted_blocks = []
+                for b in content:
+                    if b.get("type") == "text":
+                        converted_blocks.append({"type": "text", "text": b.get("text", "")})
+                    elif b.get("type") == "image_url":
+                        # OpenAI image_url → Anthropic image source 格式转换
+                        url = b.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            # base64 内嵌图片: data:image/jpeg;base64,<data>
+                            try:
+                                header, data_part = url.split(",", 1)
+                                media_type = header.split(":")[1].split(";")[0]
+                                converted_blocks.append({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data_part,
+                                    }
+                                })
+                            except Exception:
+                                pass  # 格式异常跳过
+                        else:
+                            # URL 引用图片
+                            converted_blocks.append({
+                                "type": "image",
+                                "source": {"type": "url", "url": url}
+                            })
+                    else:
+                        # 其他 block 类型原样保留
+                        converted_blocks.append(b)
+                anthropic_msgs.append({"role": role, "content": converted_blocks})
             else:
                 anthropic_msgs.append({"role": role, "content": content or ""})
 
@@ -769,8 +835,8 @@ async def _forward_anthropic(body: dict, req_id: str):
     extra_betas = []
     if model_id in _CLAUDE4_ADAPTIVE_MODELS:
         extra_betas.append("output-128k-2025-02-19")     # 128K 输出
-    # interleaved-thinking: opus-4-6 上已废弃，仅 sonnet-4-6 手动 extended thinking 时需要
-    if model_id == "claude-sonnet-4-6" and not thinking_enabled:
+    # interleaved-thinking: opus-4-6 上已废弃，仅 sonnet-4-6 开启 thinking 时需要
+    if model_id == "claude-sonnet-4-6" and thinking_enabled:
         extra_betas.append("interleaved-thinking-2025-05-14")
 
     # 客户端通过 max_context=1m 或 contextWindow>=500000 触发 1M beta
@@ -780,8 +846,8 @@ async def _forward_anthropic(body: dict, req_id: str):
         extra_betas.append("context-1m-2025-08-07")
 
     # Fast mode: opus-4-6 专属，速度提升 2.5x
+    # 仅传 speed 字段，不加 beta header（header 版本号需以实际文档为准）
     if body.get("speed") == "fast" and model_id == "claude-opus-4-6":
-        extra_betas.append("fast-mode-2026-02-01")
         anthropic_body["speed"] = "fast"
 
     headers = {
@@ -921,6 +987,16 @@ async def _forward_anthropic(body: dict, req_id: str):
                     except Exception:
                         pass
         finally:
+            # 处理 buffer 中残留的最后一行（无结尾换行的情况）
+            if buffer.strip() and buffer.strip().startswith("data:"):
+                data = buffer.strip()[5:].strip()
+                if data and data != "[DONE]":
+                    try:
+                        ev = json.loads(data)
+                        if ev.get("type") == "message_stop":
+                            yield b"data: [DONE]\n\n"
+                    except Exception:
+                        pass
             await resp.aclose()
             duration = time.time() - start
             print(f"[{req_id}] [DONE] Anthropic stream in {duration:.2f}s")
