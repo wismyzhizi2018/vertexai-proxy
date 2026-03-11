@@ -288,6 +288,18 @@ def _flatten(content: Any) -> str:
         )
     return str(content or "")
 
+def _normalize_user_content(content: Any) -> Any:
+    # Preserve OpenAI multimodal content blocks for user messages.
+    if isinstance(content, list):
+        normalized = []
+        for block in content:
+            if isinstance(block, dict):
+                normalized.append(block)
+            else:
+                normalized.append({"type": "text", "text": str(block)})
+        return normalized
+    return _flatten(content)
+
 def _truncate(text: str) -> str:
     if len(text) <= MAX_TOOL_CONTENT:
         return text
@@ -337,7 +349,8 @@ def sanitize_and_restore(body: Dict[str, Any], req_id: str, ns: str) -> Dict[str
 
     for msg in raw:
         role    = msg.get("role", "")
-        content = _flatten(msg.get("content"))
+        raw_content = msg.get("content")
+        content = _normalize_user_content(raw_content) if role == "user" else _flatten(raw_content)
 
         # ── system / developer ───────────────────────────────────
         if role in ("system", "developer"):
@@ -465,6 +478,15 @@ def _chain_summary(messages: List[Dict]) -> List[str]:
             summary.append(role)
     return summary
 
+def _map_anthropic_stop_reason(stop_reason: Optional[str]) -> str:
+    if stop_reason == "tool_use":
+        return "tool_calls"
+    if stop_reason in ("max_tokens", "model_context_window_exceeded"):
+        return "length"
+    if stop_reason in ("end_turn", "stop_sequence", None, ""):
+        return "stop"
+    return "stop"
+
 # ═══════════════════════════════════════════════════════════════
 #  流式生成器：透传 + 收集 + 缓存签名
 # ═══════════════════════════════════════════════════════════════
@@ -583,6 +605,7 @@ async def chat_completions(request: Request):
             raise HTTPException(500, "Failed to obtain Vertex AI access token.")
 
         endpoint_url = get_endpoint_url(base_model)
+        stream = bool(vertex_body.get("stream", False))
         req_obj = http_client.build_request(
             "POST",
             endpoint_url + "/chat/completions",
@@ -591,12 +614,20 @@ async def chat_completions(request: Request):
         )
         print(f"[{req_id}] → Vertex ({base_model})")
         start = time.time()
-        resp  = await http_client.send(req_obj, stream=True)
+        resp  = await http_client.send(req_obj, stream=stream)
 
         if resp.status_code >= 400:
             err = await resp.aread()
             print(f"[{req_id}] [ERROR] Vertex {resp.status_code}: {err[:500]}")
             return Response(content=err, status_code=resp.status_code,
+                            media_type="application/json")
+
+        if not stream:
+            data = await resp.aread()
+            await resp.aclose()
+            duration = time.time() - start
+            print(f"[{req_id}] [DONE] Vertex non-stream in {duration:.2f}s")
+            return Response(content=data, status_code=resp.status_code,
                             media_type="application/json")
 
         return StreamingResponse(
@@ -771,6 +802,8 @@ async def _forward_anthropic(body: dict, req_id: str):
     tc_raw = body.get("tool_choice")
     if tc_raw == "auto":
         anthropic_tool_choice = {"type": "auto"}
+    elif tc_raw == "required":
+        anthropic_tool_choice = {"type": "any"}
     elif tc_raw == "none":
         anthropic_tool_choice = None  # Anthropic 不支持 none，直接不传 tools
     elif isinstance(tc_raw, dict) and tc_raw.get("type") == "function":
@@ -893,11 +926,12 @@ async def _forward_anthropic(body: dict, req_id: str):
                                      "arguments": json.dumps(b.get("input",{}), ensure_ascii=False)}
                     })
             # stop_reason 映射
-            stop_reason = ar.get("stop_reason", "stop")
-            finish_reason = "tool_calls" if stop_reason == "tool_use" else "stop"
+            stop_reason = ar.get("stop_reason")
+            finish_reason = _map_anthropic_stop_reason(stop_reason)
             oai_resp = {
                 "id": ar.get("id",""),
                 "object": "chat.completion",
+                "created": int(time.time()),
                 "model": model_id,
                 "choices": [{
                     "index": 0,
@@ -927,6 +961,9 @@ async def _forward_anthropic(body: dict, req_id: str):
     async def convert_anthropic_stream(resp, req_id, start):
         first = True
         buffer = ""  # 跨 chunk 的不完整 SSE 行缓冲
+        message_id = ""
+        created = int(time.time())
+        role_sent = False
         try:
             async for chunk in resp.aiter_bytes():
                 if first:
@@ -946,18 +983,65 @@ async def _forward_anthropic(body: dict, req_id: str):
                         ev = json.loads(data)
                         ev_type = ev.get("type","")
 
+                        if ev_type == "message_start":
+                            message = ev.get("message", {})
+                            message_id = message.get("id", "")
+                            created = int(time.time())
+                            oai = {
+                                "id": message_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [{"delta": {"role": "assistant"}, "index": 0}]
+                            }
+                            role_sent = True
+                            yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
+                            continue
+
                         if ev_type == "content_block_delta":
                             delta = ev.get("delta",{})
                             if delta.get("type") == "thinking_delta":
                                 pass  # 过滤扩展思考内容，不透传给客户端
                             elif delta.get("type") == "text_delta":
-                                oai = {"choices":[{"delta":{"content":delta.get("text","")},"index":0}]}
+                                if not role_sent:
+                                    oai = {
+                                        "id": message_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{"delta": {"role": "assistant"}, "index": 0}]
+                                    }
+                                    role_sent = True
+                                    yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
+                                oai = {
+                                    "id": message_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices":[{"delta":{"content":delta.get("text","")},"index":0}]
+                                }
                                 yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
                             elif delta.get("type") == "input_json_delta":
-                                oai = {"choices":[{"delta":{"tool_calls":[{
-                                    "index": ev.get("index", 0),
-                                    "function":{"arguments":delta.get("partial_json","")}}
-                                ]},"index":0}]}
+                                if not role_sent:
+                                    oai = {
+                                        "id": message_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{"delta": {"role": "assistant"}, "index": 0}]
+                                    }
+                                    role_sent = True
+                                    yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
+                                oai = {
+                                    "id": message_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices":[{"delta":{"tool_calls":[{
+                                        "index": ev.get("index", 0),
+                                        "function":{"arguments":delta.get("partial_json","")}}
+                                    ]},"index":0}]
+                                }
                                 yield f"data: {json.dumps(oai)}\n\n".encode()
 
                         elif ev_type == "content_block_start":
@@ -965,20 +1049,41 @@ async def _forward_anthropic(body: dict, req_id: str):
                             if block.get("type") == "thinking":
                                 pass  # 过滤扩展思考 block
                             elif block.get("type") == "tool_use":
-                                oai = {"choices":[{"delta":{"tool_calls":[{
-                                    "index": ev.get("index", 0),
-                                    "id": block.get("id",""),
-                                    "type": "function",
-                                    "function": {"name": block.get("name",""), "arguments":""}
-                                }]},"index":0}]}
+                                if not role_sent:
+                                    oai = {
+                                        "id": message_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_id,
+                                        "choices": [{"delta": {"role": "assistant"}, "index": 0}]
+                                    }
+                                    role_sent = True
+                                    yield f"data: {json.dumps(oai, ensure_ascii=False)}\n\n".encode()
+                                oai = {
+                                    "id": message_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_id,
+                                    "choices":[{"delta":{"tool_calls":[{
+                                        "index": ev.get("index", 0),
+                                        "id": block.get("id",""),
+                                        "type": "function",
+                                        "function": {"name": block.get("name",""), "arguments":""}
+                                    }]},"index":0}]
+                                }
                                 yield f"data: {json.dumps(oai)}\n\n".encode()
 
                         elif ev_type == "message_delta":
                             # BUG FIX 8: 补发 finish_reason
                             delta = ev.get("delta", {})
-                            stop_reason = delta.get("stop_reason","")
-                            finish = "tool_calls" if stop_reason == "tool_use" else "stop"
-                            oai = {"choices":[{"delta":{},"index":0,"finish_reason": finish}]}
+                            finish = _map_anthropic_stop_reason(delta.get("stop_reason"))
+                            oai = {
+                                "id": message_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices":[{"delta":{},"index":0,"finish_reason": finish}]
+                            }
                             yield f"data: {json.dumps(oai)}\n\n".encode()
 
                         elif ev_type == "message_stop":

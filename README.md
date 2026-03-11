@@ -2,7 +2,7 @@
 
 > [OpenClaw 是什么？访问地址](https://github.com/openclaw/openclaw)
 
-把 Google Vertex AI 上的 Gemini 模型以及 Anthropic Claude 模型统一封装成 **OpenAI 兼容接口**，供 OpenClaw 及其他客户端使用。
+把 Google Vertex AI 上的 Gemini 模型以及 Anthropic Claude 模型统一封装成 **OpenAI Chat Completions 兼容接口**，供 OpenClaw 及其他客户端使用。
 
 ---
 
@@ -12,7 +12,7 @@
 
 | 特性 | 说明 |
 |------|------|
-| **OpenAI 协议兼容** | 标准 `/v1/chat/completions` 接口，无需改造客户端 |
+| **OpenAI Chat Completions 兼容** | 标准 `/v1/chat/completions` 接口，无需改造客户端 |
 | **双后端路由** | `google/gemini-*` 路由到 Vertex AI，`anthropic/claude-*` 路由到 Anthropic API |
 | **thought_signature 自动补全** | Gemini 思考模型要求签名字段，代理自动缓存并补回，工具调用链不断裂 |
 | **SQLite 持久化缓存** | 签名写入本地数据库，代理重启后无需重新获取，长会话不中断 |
@@ -100,7 +100,7 @@ curl http://localhost:8000/health
 ```json
 {
   "status": "ok",
-  "version": "v28.0",
+  "version": "v29.0",
   "active_namespaces": 1,
   "cached_signatures": 12,
   "cache_db": "/var/lib/vertexai-proxy/sig_cache.db",
@@ -110,6 +110,14 @@ curl http://localhost:8000/health
 ```
 
 ### 接口测试
+
+当前代理重点兼容的是 **`/v1/chat/completions`**：
+
+- 非流式请求返回 `application/json`
+- 流式请求返回 `text/event-stream`
+- Anthropic 路径会转换成 OpenAI 风格的 `chat.completion` / `chat.completion.chunk`
+- 支持 `tool_choice: "auto" | "none" | "required"` 以及指定函数
+- 用户消息中的 OpenAI 多模态 `content` block 会保留，不会在进入 Gemini 路径前被压平成纯文本
 
 ```bash
 # 基础对话
@@ -139,6 +147,42 @@ curl -X POST http://localhost:8000/v1/chat/completions \
       {"role": "assistant", "content": "法国首都是巴黎。"},
       {"role": "user", "content": "德国呢？"}
     ]
+  }'
+```
+
+### 本地回归测试
+
+代码仓库内置了一个离线回归测试，启动前即可跑，不依赖真实 Vertex / Anthropic：
+
+```bash
+python3 -m unittest -v test_proxy_format.py
+```
+
+覆盖项：
+
+- Vertex 非流式返回 JSON
+- Vertex 路径保留用户多模态 `content` block
+- Anthropic 非流式 `finish_reason` / `tool_choice=required`
+- Anthropic 流式 SSE 转 OpenAI chunk 格式
+
+如果你要在本机真实起服务后再做一次 smoke test，可以直接用：
+
+```bash
+curl -i http://localhost:8000/health
+
+curl -i -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/gemini-3.1-flash-lite-preview",
+    "messages": [{"role":"user","content":"hello"}]
+  }'
+
+curl -i -N -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "anthropic/claude-sonnet-4-5",
+    "stream": true,
+    "messages": [{"role":"user","content":"hello"}]
   }'
 ```
 
@@ -341,6 +385,7 @@ sqlite3 /var/lib/vertexai-proxy/sig_cache.db "DELETE FROM sig_cache;"
 | 2026-03-10 | v26–27 | 多用户 ns 隔离，gcloud token 缓存，日志优化 |
 | 2026-03-10 | v28 | **SQLite 持久化**：签名跨重启保留，解决长会话 400 问题 |
 | 2026-03-10 | v29 | **双后端路由**：新增 Anthropic Claude API 支持，model 前缀自动分流 |
+| 2026-03-11 | v29.1 | 修复 `/v1/chat/completions` 兼容性：Vertex 非流式 JSON、Anthropic OpenAI 风格 SSE、`tool_choice=required`、回归测试补齐 |
 
 ---
 
